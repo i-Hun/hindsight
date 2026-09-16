@@ -484,6 +484,23 @@ class TestBankProfileBranches:
             + build_disposition_description(DispositionTraits(skepticism=3, literalism=2, empathy=4)),
         )
 
+    def test_all_neutral_disposition_adds_nothing_beyond_the_trait_line(self):
+        """A bank that never configured the traits keeps the prompt it had before."""
+        actual = build_system_prompt_for_tools(
+            bank_profile={
+                "name": "TestBank",
+                "mission": "",
+                "disposition": {"skepticism": 3, "literalism": 3, "empathy": 3},
+            },
+            has_mental_models=False,
+            include_observations=False,
+        )
+        assert actual == _assemble(
+            _RETRIEVAL_RECALL_ONLY,
+            _WORKFLOW_RECALL_ONLY,
+            trailer="\nDisposition: skepticism=3, literalism=3, empathy=3",
+        )
+
     def test_disposition_spells_out_what_each_level_means(self):
         """The numbers alone are metadata; a weaker model needs the behaviour named."""
         actual = build_system_prompt_for_tools(

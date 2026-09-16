@@ -21,6 +21,8 @@ from .tokenization import count_prompt_tokens
 #: the disposition model itself documents.
 _NEUTRAL_TRAIT = 3
 
+_TRAITS = ("skepticism", "literalism", "empathy")
+
 # Fraction of max_context_tokens reserved for tool results in the final synthesis prompt.
 # The remainder covers the system prompt, question, bank context, and output tokens.
 _FINAL_PROMPT_CONTEXT_FRACTION = 0.8
@@ -161,11 +163,15 @@ def bank_disposition_line(bank_profile: dict[str, Any]) -> str:
     Shared with the prompt preview — see :func:`bank_name_line`.
     """
     disposition = bank_profile.get("disposition") or {}
-    traits = [
-        f"{trait}={disposition[trait]}" for trait in ("skepticism", "literalism", "empathy") if trait in disposition
-    ]
+    traits = [f"{trait}={disposition[trait]}" for trait in _TRAITS if trait in disposition]
     if not traits:
         return ""
+
+    # An all-neutral disposition is what a bank that never touched the traits reports, so
+    # it keeps the exact prompt it had before this block existed — nothing is added and no
+    # bank pays for a feature it did not configure.
+    if all(disposition.get(trait, _NEUTRAL_TRAIT) == _NEUTRAL_TRAIT for trait in _TRAITS):
+        return f"Disposition: {', '.join(traits)}"
 
     # The numbers alone are not an instruction: a weaker model reads "skepticism=5" as
     # metadata and answers exactly as it would at skepticism=1 — which is what
