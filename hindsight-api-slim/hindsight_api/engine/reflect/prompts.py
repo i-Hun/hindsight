@@ -13,7 +13,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..prompt_utils import default_language_section, escape_for_prompt, output_language_directive
+from ..response_models import DispositionTraits
+from ..search.think_utils import build_disposition_description
 from .tokenization import count_prompt_tokens
+
+#: Trait value used for a trait the bank does not set, matching the neutral default
+#: the disposition model itself documents.
+_NEUTRAL_TRAIT = 3
 
 # Fraction of max_context_tokens reserved for tool results in the final synthesis prompt.
 # The remainder covers the system prompt, question, bank context, and output tokens.
@@ -158,7 +164,22 @@ def bank_disposition_line(bank_profile: dict[str, Any]) -> str:
     traits = [
         f"{trait}={disposition[trait]}" for trait in ("skepticism", "literalism", "empathy") if trait in disposition
     ]
-    return f"Disposition: {', '.join(traits)}" if traits else ""
+    if not traits:
+        return ""
+
+    # The numbers alone are not an instruction: a weaker model reads "skepticism=5" as
+    # metadata and answers exactly as it would at skepticism=1 — which is what
+    # test_high_skepticism_response_is_more_hedged_than_low keeps catching on
+    # gemini-2.5-flash-lite. Spelling out what each level means is what the non-tool
+    # think path has always done; this reuses its wording rather than inventing a second.
+    described = build_disposition_description(
+        DispositionTraits(
+            skepticism=disposition.get("skepticism", _NEUTRAL_TRAIT),
+            literalism=disposition.get("literalism", _NEUTRAL_TRAIT),
+            empathy=disposition.get("empathy", _NEUTRAL_TRAIT),
+        )
+    )
+    return f"Disposition: {', '.join(traits)}\n{described}"
 
 
 def build_system_prompt_for_tools(
