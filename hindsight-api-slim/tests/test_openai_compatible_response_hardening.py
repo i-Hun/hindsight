@@ -597,4 +597,3 @@ def test_rate_limit_retry_at_ignores_a_non_positive_or_unparsable_retry_after() 
     for value in (0, -5, "soon", None):
         error = SimpleNamespace(body={"detail": {"retry_after": value}}, response=SimpleNamespace(headers={}))
         assert _rate_limit_retry_at(error) is None
-
