@@ -569,6 +569,36 @@ _RECURSIVE_TEXT_SEPARATORS = [
 ]
 
 
+# --------------------------------------------------------------------------------------------
+# A JSON-encoded body reaches the chunker as ONE line: every real line break was escaped to the
+# two-character sequence ``\n``. The line structure the extractor needs — git-diff hunks, log
+# records, ``##`` headers — is then invisible, and the model has to guess where one line ends:
+# measured on a 13 453-character retained body (122 literal "\n", zero real ones)
+# no chunk at all was parseable as a diff, and the extractor called two UNCHANGED diff lines
+# "added". Restoring the line breaks here — on the text handed to the splitter — fixes the
+# reading while leaving ``documents.original_text`` untouched and valid JSON.
+#
+# Note (measured): merely adding the literal ``\n`` to ``_RECURSIVE_TEXT_SEPARATORS`` does NOT
+# help — the splitter keeps the separator, so every chunk is still a single line (real line
+# breaks in chunks = 0, diff-parseable chunks = 0).
+_LITERAL_LINE_BREAKS = (("\\r\\n", "\n"), ("\\n", "\n"), ("\\r", "\r"))
+
+
+def _restore_literal_line_breaks(text: str) -> str:
+    """Turn escaped line breaks of a JSON-encoded single-line body back into real ones.
+
+    Only the documented "the whole body is one line" case is touched: text that already holds a
+    real line break, or fewer than two literal ``\n``, is returned unchanged (a one-off mention of
+    ``\n`` inside a single-line path or regex is not a line break).
+    """
+    if "\n" in text or text.count("\\n") < 2:
+        return text
+    out = text.replace("\\\\", "\x00")          # protect escaped backslashes
+    for escaped, real in _LITERAL_LINE_BREAKS:
+        out = out.replace(escaped, real)
+    return out.replace("\x00", "\\")
+
+
 def _iter_separator_splits(text: str, separator: str) -> Iterator[str]:
     """Yield ``text`` cut at every occurrence of ``separator``, separator kept on the right.
 
@@ -820,7 +850,9 @@ def iter_chunks(
         if len(text) <= structured_limit:
             yield text
         else:
-            yield from _iter_recursive_splits(text, max_chars, _RECURSIVE_TEXT_SEPARATORS)
+            yield from _iter_recursive_splits(
+                _restore_literal_line_breaks(text), max_chars, _RECURSIVE_TEXT_SEPARATORS
+            )
         return
 
     # Try to parse as JSONL (newline-delimited JSON objects, e.g. session logs)
@@ -829,7 +861,9 @@ def iter_chunks(
         return
 
     # Fall back to sentence-aware text splitting
-    yield from _iter_recursive_splits(text, max_chars, _RECURSIVE_TEXT_SEPARATORS)
+    yield from _iter_recursive_splits(
+        _restore_literal_line_breaks(text), max_chars, _RECURSIVE_TEXT_SEPARATORS
+    )
 
 
 def chunk_text(
