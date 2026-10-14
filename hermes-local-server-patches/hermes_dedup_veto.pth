@@ -1,0 +1,2 @@
+import sys; sys.path.insert(0, "/home/hun/.hermes/lib")
+import hermes_dedup_veto; hermes_dedup_veto.install()

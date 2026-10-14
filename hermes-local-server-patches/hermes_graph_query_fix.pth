@@ -1,0 +1,2 @@
+import sys; sys.path.insert(0, "/home/hun/.hermes/lib")
+import hermes_graph_query_fix; hermes_graph_query_fix.install()

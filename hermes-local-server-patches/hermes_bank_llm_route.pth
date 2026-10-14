@@ -1,0 +1,2 @@
+import sys; sys.path.insert(0, "/home/hun/.hermes/lib")
+import hermes_bank_llm_route; hermes_bank_llm_route.install()

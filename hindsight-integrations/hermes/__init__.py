@@ -65,6 +65,92 @@ from .settings import (
 
 logger = logging.getLogger(__name__)
 
+
+# --- Local patch (t_38ec6109, 25.09.2026): retain-side secret scrub -------------------------
+# Lived in the ACP-bridge overlay until its retirement (24.09); the catalog reinstall dropped
+# it while every profile config kept ``retain_redact_secrets: true`` — a switch no code read.
+# 24.09 a live Telegram bot token went into hermes-default verbatim. A leaked secret cannot be
+# curated back out (vector, BM25 signals, entity graph at once); prompt bans were measured
+# useless (30.08: the extractor copied secrets 4/4 runs), so this is a deterministic scrub.
+# Pattern set mirrors scripts/hindsight-secret-scan.py. Upstream candidate (ADR-0035).
+import re as _re
+
+_SECRET_MASK = "<redacted-secret>"
+_SECRET_PATTERNS: tuple = (
+    ("gitlab-pat", _re.compile(r"glpat-[A-Za-z0-9_\-]{16,}")),
+    ("github-pat", _re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}")),
+    ("anthropic-key", _re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}")),
+    ("openai-key", _re.compile(r"\bsk-[A-Za-z0-9]{20,}")),
+    ("slack-token", _re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}")),
+    ("aws-key", _re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("tg-bot-token", _re.compile(r"(?<!\d)\d{8,12}:AA[A-Za-z0-9_\-]{30,}")),
+    ("private-key", _re.compile(
+        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----.*?-----END [^-]*-----", _re.DOTALL)),
+)
+_SECRET_LITERAL_CACHE: Dict[str, tuple] = {}
+
+
+def _load_secret_literals(paths: Any) -> List[str]:
+    """Secret VALUES read from files (shapeless passwords no pattern can see); cached by mtime/size."""
+    literals: List[str] = []
+    for raw in _normalize_retain_tags(paths):
+        path = os.path.expanduser(str(raw).strip())
+        if not path:
+            continue
+        try:
+            st = os.stat(path)
+        except OSError:
+            _SECRET_LITERAL_CACHE.pop(path, None)
+            continue
+        cached = _SECRET_LITERAL_CACHE.get(path)
+        if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+            value = cached[2]
+        else:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    value = fh.read().strip()
+            except OSError:
+                continue
+            _SECRET_LITERAL_CACHE[path] = (st.st_mtime, st.st_size, value)
+        # Below 6 chars a "secret" is likelier a common substring; masking it would shred text.
+        if len(value) >= 6:
+            literals.append(value)
+    return literals
+
+
+def _redact_secrets(text: str, literals: List[str]) -> tuple:
+    """Return (cleaned text, {kind: count}); the value itself is never reported."""
+    if not text:
+        return text, {}
+    hits: Dict[str, int] = {}
+    for literal in literals:
+        n = text.count(literal)
+        if n:
+            text = text.replace(literal, _SECRET_MASK)
+            hits["literal"] = hits.get("literal", 0) + n
+    for kind, rx in _SECRET_PATTERNS:
+        text, n = rx.subn(_SECRET_MASK, text)
+        if n:
+            hits[kind] = hits.get(kind, 0) + n
+    return text, hits
+
+_CRON_PROMPT_MARKER = "[scheduled cron job prompt omitted: static instruction, not a new fact]"
+# Blocks built by cron/scheduler_prompt.py::_prepend_context_block and the ``## Run Context`` suffix.
+# "Your previous run's output" and the job notepad are deliberately NOT kept: the former is the last
+# run's answer (already retained), the latter is job config.
+_CRON_DATA_BLOCK_RE = _re.compile(
+    r"## (Script Output|Script Error|Output from job '[^'\n]*')\n[^\n]*\n\n```\n(.*?)\n```\n\n", _re.DOTALL
+)
+_CRON_RUN_CONTEXT_RE = _re.compile(r"\n\n## Run Context\n(.*?)(?=\n\n## Run Context\n|\Z)", _re.DOTALL)
+
+
+def _cron_user_content_for_retain(text: str) -> str:
+    """Drop a cron turn's static prompt, keep the per-run data the scheduler injected into it."""
+    kept = [f"## {m.group(1)}\n{m.group(2).strip()}" for m in _CRON_DATA_BLOCK_RE.finditer(text)]
+    kept += [f"## Run Context\n{m.group(1).strip()}" for m in _CRON_RUN_CONTEXT_RE.finditer(text)]
+    return "\n\n".join([_CRON_PROMPT_MARKER, *[k for k in kept if k.strip()]])
+
+
 _LOCAL_MODES = {"local", "local_embedded"}
 _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
 
@@ -1063,6 +1149,10 @@ class HindsightMemoryProvider(MemoryProvider):
         # for the queue to drain AND the server-side op(s) to complete.
         self._prefetch_waits_for_retain = cfg.get("prefetch_waits_for_retain", True)
         self._prefetch_retain_drain_timeout = float(cfg.get("prefetch_retain_drain_timeout", 10.0))
+        # Local patch (t_38ec6109): deterministic secret scrub on the way out, ON by default.
+        # ``retain_secret_files`` lists files whose CONTENT is the secret (shapeless values).
+        self._retain_redact_secrets = bool(cfg.get("retain_redact_secrets", True))
+        self._retain_secret_files = _normalize_retain_tags(cfg.get("retain_secret_files"))
 
     def _apply_recall_settings(self, cfg: dict) -> None:
         """Recall knobs are pure config too (``{}`` yields the defaults)."""
@@ -1315,6 +1405,20 @@ class HindsightMemoryProvider(MemoryProvider):
         """Build one aretain_batch item. The server resolves occurred_start/end (incl.
         relative phrases in content) from the item timestamp: explicit occurred_at
         wins, else the configured event clock."""
+        # Local patch (t_38ec6109): secret scrub at the SINGLE choke point — sync_turn,
+        # the retain tool and the flush all build their payload here. Both text fields.
+        if getattr(self, "_retain_redact_secrets", True):
+            literals = _load_secret_literals(getattr(self, "_retain_secret_files", []))
+            content, redacted = _redact_secrets(content, literals)
+            if isinstance(context, str) and context:
+                context, ctx_hits = _redact_secrets(context, literals)
+                for kind, count in ctx_hits.items():
+                    redacted[kind] = redacted.get(kind, 0) + count
+            if redacted:
+                logger.warning(
+                    "Hindsight retain: redacted secrets before send: %s",
+                    ", ".join(f"{kind}x{count}" for kind, count in sorted(redacted.items())),
+                )
         item: Dict[str, Any] = {
             # See #93568.
             "content": content,
@@ -1390,6 +1494,15 @@ class HindsightMemoryProvider(MemoryProvider):
         if session_id:
             self._session_id = str(session_id).strip()
 
+        # Local patch (t_da67bb2a, 25.09.2026): a cron turn's "user" message is the job's static
+        # prompt, identical on every tick. Shipping it made the extractor re-mint the prompt's rules
+        # as fresh facts each run (hermes-secretary: ~24 copies/day of every rule from the 20-min
+        # inbox watch). Keep only what the run produced; the prompt is config, not memory.
+        # Review fix (25.09): the scheduler prepends per-run DATA (pre-run script stdout, upstream job
+        # output) and appends ``## Run Context`` to that same message — those are fresh facts, keep them.
+        if self._platform == "cron" and user_content:
+            user_content = _cron_user_content_for_retain(user_content)
+
         self._session_turns.append(
             json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False)
         )
@@ -1458,9 +1571,12 @@ class HindsightMemoryProvider(MemoryProvider):
             content, context=context, tags=args.get("tags"), occurred_at=args.get("occurred_at")
         )
         logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s", self._bank_id, len(content), context)
-        self._retain_batch(item, bank_id=self._bank_id)
-        logger.debug("Tool hindsight_retain: success")
-        return "Memory stored successfully."
+        # Local patch (t_da67bb2a, 25.09.2026): the tool path used to omit retain_async, so the
+        # server ran fact extraction (local bonsai, 60-240 s) inside the request and the call died
+        # on the 120 s client timeout. Honour the configured retain_async like the auto-retain path.
+        self._retain_batch(item, bank_id=self._bank_id, retain_async=self._retain_async)
+        logger.debug("Tool hindsight_retain: success (async=%s)", self._retain_async)
+        return "Memory queued for storage." if self._retain_async else "Memory stored successfully."
 
     def _tool_recall(self, args: dict) -> str:
         query = args["query"]
@@ -1495,7 +1611,8 @@ class HindsightMemoryProvider(MemoryProvider):
             return json.dumps({"result": handler(self, args)})
         except Exception as e:
             logger.warning("%s failed: %s", tool_name, e, exc_info=True)
-            return tool_error(f"{failure}: {e}")
+            # str(TimeoutError()) is "" — always name the exception class so the error carries text.
+            return tool_error(f"{failure}: {type(e).__name__}: {e}" if str(e) else f"{failure}: {type(e).__name__}")
 
     # -- session lifecycle -------------------------------------------------------
 
